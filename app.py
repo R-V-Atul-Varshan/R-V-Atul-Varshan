@@ -1,206 +1,244 @@
+import os
+import uuid
+import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import sqlite3
-import os
-import cv2
-import numpy as np
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-CORS(app)
 
-UPLOAD_FOLDER = "uploads"
+# â”€â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL", "sqlite:///hazeapp.db"
+).replace("postgres://", "postgresql://")          # Render uses postgres:// but SQLAlchemy needs postgresql://
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "hazeapp-secret-change-in-prod")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(days=7)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024   # 16 MB
+
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-DATABASE = "database.db"
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff"}
 
+# â”€â”€â”€ Extensions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+db     = SQLAlchemy(app)
+bcrypt = Bcrypt(app)
+jwt    = JWTManager(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# -----------------------
-# DATABASE INIT
-# -----------------------
-
-def init_db():
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        email TEXT,
-        password TEXT
-    )
-    """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS history(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        filename TEXT
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-init_db()
+# â”€â”€â”€ Models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+class User(db.Model):
+    __tablename__ = "users"
+    id         = db.Column(db.Integer, primary_key=True)
+    username   = db.Column(db.String(80),  unique=True, nullable=False)
+    email      = db.Column(db.String(120), unique=True, nullable=False)
+    password   = db.Column(db.String(200), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    images     = db.relationship("Image", backref="owner", lazy=True, cascade="all, delete")
 
 
-# -----------------------
-# HAZE REMOVAL FUNCTION
-# -----------------------
-
-def remove_haze(image_path):
-
-    img = cv2.imread(image_path)
-
-    # convert to LAB color space
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    # CLAHE improves contrast
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    cl = clahe.apply(l)
-
-    merged = cv2.merge((cl,a,b))
-    enhanced = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-
-    # additional sharpening
-    kernel = np.array([[0,-1,0],
-                       [-1,5,-1],
-                       [0,-1,0]])
-
-    sharpened = cv2.filter2D(enhanced,-1,kernel)
-
-    return sharpened
+class Image(db.Model):
+    __tablename__ = "images"
+    id            = db.Column(db.Integer, primary_key=True)
+    user_id       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    filename      = db.Column(db.String(200), nullable=False)          # stored name (uuid)
+    original_name = db.Column(db.String(200), nullable=False)          # original filename
+    file_size     = db.Column(db.Integer, nullable=False)              # bytes
+    mimetype      = db.Column(db.String(100), nullable=False)
+    uploaded_at   = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    download_count= db.Column(db.Integer, default=0)
+    last_download = db.Column(db.DateTime, nullable=True)
 
 
-# -----------------------
-# SIGNUP
-# -----------------------
+with app.app_context():
+    db.create_all()
 
-@app.route("/signup", methods=["POST"])
+# â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def image_to_dict(img):
+    return {
+        "id":             img.id,
+        "original_name":  img.original_name,
+        "file_size":      img.file_size,
+        "mimetype":       img.mimetype,
+        "uploaded_at":    img.uploaded_at.isoformat(),
+        "download_count": img.download_count,
+        "last_download":  img.last_download.isoformat() if img.last_download else None,
+    }
+
+# â”€â”€â”€ Auth Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.route("/api/signup", methods=["POST"])
 def signup():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    email    = (data.get("email")    or "").strip().lower()
+    password =  data.get("password") or ""
 
-    data = request.json
+    if not username or not email or not password:
+        return jsonify({"error": "All fields are required"}), 400
+    if len(username) < 3:
+        return jsonify({"error": "Username must be at least 3 characters"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if User.query.filter_by(username=username).first():
+        return jsonify({"error": "Username already taken"}), 409
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "Email already registered"}), 409
 
-    username = data.get("username")
-    email = data.get("email")
-    password = data.get("password")
+    hashed = bcrypt.generate_password_hash(password).decode("utf-8")
+    user   = User(username=username, email=email, password=hashed)
+    db.session.add(user)
+    db.session.commit()
 
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-
-    c.execute(
-        "INSERT INTO users(username,email,password) VALUES(?,?,?)",
-        (username,email,password)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({"message":"Signup success"})
+    token = create_access_token(identity=str(user.id))
+    return jsonify({"token": token, "username": user.username, "email": user.email}), 201
 
 
-# -----------------------
-# LOGIN
-# -----------------------
-
-@app.route("/login", methods=["POST"])
+@app.route("/api/login", methods=["POST"])
 def login():
+    data     = request.get_json(silent=True) or {}
+    email    = (data.get("email")    or "").strip().lower()
+    password =  data.get("password") or ""
 
-    data = request.json
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
 
-    email = data.get("email")
-    password = data.get("password")
+    user = User.query.filter_by(email=email).first()
+    if not user or not bcrypt.check_password_hash(user.password, password):
+        return jsonify({"error": "Invalid email or password"}), 401
 
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-
-    c.execute(
-        "SELECT id FROM users WHERE email=? AND password=?",
-        (email,password)
-    )
-
-    user = c.fetchone()
-
-    conn.close()
-
-    if user:
-        return jsonify({"user_id":user[0]})
-    else:
-        return jsonify({"error":"Invalid login"})
+    token = create_access_token(identity=str(user.id))
+    return jsonify({"token": token, "username": user.username, "email": user.email}), 200
 
 
-# -----------------------
-# UPLOAD IMAGE
-# -----------------------
+@app.route("/api/me", methods=["GET"])
+@jwt_required()
+def me():
+    user = User.query.get(int(get_jwt_identity()))
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({"username": user.username, "email": user.email,
+                    "created_at": user.created_at.isoformat()}), 200
 
-@app.route("/upload", methods=["POST"])
+# â”€â”€â”€ Image Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.route("/api/upload", methods=["POST"])
+@jwt_required()
 def upload():
+    if "image" not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
 
     file = request.files["image"]
-    user_id = request.form["user_id"]
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+    if not allowed_file(file.filename):
+        return jsonify({"error": "File type not allowed. Use PNG, JPG, GIF, WEBP, BMP, or TIFF"}), 400
 
-    filepath = os.path.join(UPLOAD_FOLDER,file.filename)
+    ext           = file.filename.rsplit(".", 1)[1].lower()
+    stored_name   = f"{uuid.uuid4()}.{ext}"
+    save_path     = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
+    file.save(save_path)
+    file_size     = os.path.getsize(save_path)
 
-    file.save(filepath)
+    img = Image(
+        user_id       = int(get_jwt_identity()),
+        filename      = stored_name,
+        original_name = secure_filename(file.filename),
+        file_size     = file_size,
+        mimetype      = file.mimetype or f"image/{ext}",
+    )
+    db.session.add(img)
+    db.session.commit()
 
-    # haze removal
-    result = remove_haze(filepath)
+    return jsonify({"message": "Upload successful", "image": image_to_dict(img)}), 201
 
-    cv2.imwrite(filepath,result)
 
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
+@app.route("/api/download/<int:image_id>", methods=["GET"])
+@jwt_required()
+def download(image_id):
+    user_id = int(get_jwt_identity())
+    img     = Image.query.filter_by(id=image_id, user_id=user_id).first()
+    if not img:
+        return jsonify({"error": "Image not found or access denied"}), 404
 
-    c.execute(
-        "INSERT INTO history(user_id,filename) VALUES(?,?)",
-        (user_id,file.filename)
+    img.download_count += 1
+    img.last_download   = datetime.datetime.utcnow()
+    db.session.commit()
+
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"],
+        img.filename,
+        as_attachment=True,
+        download_name=img.original_name
     )
 
-    conn.commit()
-    conn.close()
 
-    return jsonify({"file":file.filename})
+@app.route("/api/history", methods=["GET"])
+@jwt_required()
+def history():
+    user_id = int(get_jwt_identity())
+    page    = request.args.get("page",  1,  type=int)
+    per_page= request.args.get("limit", 10, type=int)
+    per_page= min(per_page, 50)
 
+    pagination = (Image.query
+                  .filter_by(user_id=user_id)
+                  .order_by(Image.uploaded_at.desc())
+                  .paginate(page=page, per_page=per_page, error_out=False))
 
-# -----------------------
-# HISTORY
-# -----------------------
-
-@app.route("/history/<user_id>")
-def history(user_id):
-
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-
-    c.execute(
-        "SELECT filename FROM history WHERE user_id=?",
-        (user_id,)
-    )
-
-    rows = c.fetchall()
-
-    conn.close()
-
-    files = [r[0] for r in rows]
-
-    return jsonify(files)
+    return jsonify({
+        "images":      [image_to_dict(i) for i in pagination.items],
+        "total":       pagination.total,
+        "page":        pagination.page,
+        "total_pages": pagination.pages,
+        "has_next":    pagination.has_next,
+        "has_prev":    pagination.has_prev,
+    }), 200
 
 
-# -----------------------
-# DOWNLOAD
-# -----------------------
+@app.route("/api/image/<int:image_id>", methods=["DELETE"])
+@jwt_required()
+def delete_image(image_id):
+    user_id = int(get_jwt_identity())
+    img     = Image.query.filter_by(id=image_id, user_id=user_id).first()
+    if not img:
+        return jsonify({"error": "Image not found or access denied"}), 404
 
-@app.route("/download/<filename>")
-def download(filename):
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], img.filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    db.session.delete(img)
+    db.session.commit()
+    return jsonify({"message": "Image deleted"}), 200
 
-    return send_from_directory(UPLOAD_FOLDER,filename)
+
+@app.route("/api/stats", methods=["GET"])
+@jwt_required()
+def stats():
+    user_id     = int(get_jwt_identity())
+    images      = Image.query.filter_by(user_id=user_id).all()
+    total_up    = len(images)
+    total_dl    = sum(i.download_count for i in images)
+    total_size  = sum(i.file_size for i in images)
+    return jsonify({
+        "total_uploads":   total_up,
+        "total_downloads": total_dl,
+        "total_size_bytes": total_size,
+    }), 200
 
 
-# -----------------------
-# RUN
-# -----------------------
+# â”€â”€â”€ Health check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "HazeApp API"}), 200
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0",port=5000,debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
