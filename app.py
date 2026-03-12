@@ -1,33 +1,35 @@
-from flask import Flask, request, jsonify, send_from_directory
-import os
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 import sqlite3
 import cv2
 import numpy as np
-from datetime import datetime
-from flask_cors import CORS
+import os
+import uuid
 
 app = Flask(__name__)
 CORS(app)
 
 UPLOAD_FOLDER = "uploads"
-OUTPUT_FOLDER = "outputs"
+RESULT_FOLDER = "results"
 DB = "database.db"
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(RESULT_FOLDER, exist_ok=True)
 
-# -----------------------
+
+# --------------------------
 # DATABASE INIT
-# -----------------------
+# --------------------------
 
 def init_db():
+
     conn = sqlite3.connect(DB)
     c = conn.cursor()
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
+        username TEXT,
         password TEXT
     )
     """)
@@ -37,80 +39,71 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT,
         original TEXT,
-        output TEXT,
-        date TEXT
+        result TEXT
     )
     """)
 
     conn.commit()
     conn.close()
 
+
 init_db()
 
-# -----------------------
-# IMAGE DEHAZE FUNCTION
-# -----------------------
 
-def dehaze(image):
+# --------------------------
+# IMAGE DEHAZE
+# --------------------------
 
-    img = image.astype(np.float32) / 255
+def dehaze(img):
 
-    dark = np.min(img, axis=2)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15,15))
-    dark = cv2.erode(dark, kernel)
+    l,a,b = cv2.split(lab)
 
-    A = np.max(img)
+    clahe = cv2.createCLAHE(clipLimit=3.0)
 
-    t = 1 - 0.95 * dark
-    t = np.clip(t,0.1,1)
+    cl = clahe.apply(l)
 
-    J = np.zeros_like(img)
+    merged = cv2.merge((cl,a,b))
 
-    for i in range(3):
-        J[:,:,i] = (img[:,:,i] - A) / t + A
-
-    J = np.clip(J,0,1)
-
-    result = (J*255).astype(np.uint8)
+    result = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
     return result
 
 
-# -----------------------
+# --------------------------
 # SIGNUP
-# -----------------------
+# --------------------------
 
 @app.route("/signup", methods=["POST"])
 def signup():
 
     data = request.json
+
     username = data["username"]
     password = data["password"]
 
     conn = sqlite3.connect(DB)
     c = conn.cursor()
 
-    try:
-        c.execute("INSERT INTO users(username,password) VALUES(?,?)",(username,password))
-        conn.commit()
-        msg = "Signup successful"
-    except:
-        msg = "User already exists"
+    c.execute("INSERT INTO users(username,password) VALUES(?,?)",
+              (username,password))
 
+    conn.commit()
     conn.close()
 
-    return jsonify({"message":msg})
+    return jsonify({"msg":"Signup success"})
 
 
-# -----------------------
+# --------------------------
 # LOGIN
-# -----------------------
+# --------------------------
 
 @app.route("/login", methods=["POST"])
 def login():
 
     data = request.json
+
     username = data["username"]
     password = data["password"]
 
@@ -125,14 +118,14 @@ def login():
     conn.close()
 
     if user:
-        return jsonify({"message":"Login success"})
+        return jsonify({"msg":"Login success"})
     else:
-        return jsonify({"message":"Invalid login"}),401
+        return jsonify({"msg":"Invalid credentials"})
 
 
-# -----------------------
-# IMAGE UPLOAD + DEHAZE
-# -----------------------
+# --------------------------
+# UPLOAD + DEHAZE
+# --------------------------
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -140,50 +133,36 @@ def upload():
     username = request.form["username"]
     file = request.files["image"]
 
-    original_name = file.filename
-    upload_path = os.path.join(UPLOAD_FOLDER, original_name)
+    uid = str(uuid.uuid4())
 
-    file.save(upload_path)
+    original_path = f"{UPLOAD_FOLDER}/{uid}.jpg"
+    result_path = f"{RESULT_FOLDER}/{uid}.jpg"
 
-    img = cv2.imread(upload_path)
+    file.save(original_path)
+
+    img = cv2.imread(original_path)
 
     result = dehaze(img)
 
-    output_name = "dehazed_" + original_name
-    output_path = os.path.join(OUTPUT_FOLDER, output_name)
-
-    cv2.imwrite(output_path, result)
+    cv2.imwrite(result_path,result)
 
     conn = sqlite3.connect(DB)
     c = conn.cursor()
 
     c.execute(
-        "INSERT INTO history(username,original,output,date) VALUES(?,?,?,?)",
-        (username, original_name, output_name, str(datetime.now()))
+        "INSERT INTO history(username,original,result) VALUES(?,?,?)",
+        (username,original_path,result_path)
     )
 
     conn.commit()
     conn.close()
 
-    return jsonify({
-        "message":"Image processed",
-        "download":"/download/"+output_name
-    })
+    return send_file(result_path, mimetype="image/jpeg")
 
 
-# -----------------------
-# DOWNLOAD IMAGE
-# -----------------------
-
-@app.route("/download/<filename>")
-def download(filename):
-
-    return send_from_directory(OUTPUT_FOLDER, filename, as_attachment=True)
-
-
-# -----------------------
+# --------------------------
 # USER HISTORY
-# -----------------------
+# --------------------------
 
 @app.route("/history/<username>")
 def history(username):
@@ -192,28 +171,18 @@ def history(username):
     c = conn.cursor()
 
     rows = c.execute(
-        "SELECT original,output,date FROM history WHERE username=?",
+        "SELECT result FROM history WHERE username=?",
         (username,)
     ).fetchall()
 
     conn.close()
 
-    history = []
+    images = [r[0] for r in rows]
 
-    for r in rows:
-        history.append({
-            "original":r[0],
-            "output":r[1],
-            "date":r[2],
-            "download":"/download/"+r[1]
-        })
-
-    return jsonify(history)
+    return jsonify(images)
 
 
-# -----------------------
-# RUN SERVER
-# -----------------------
+# --------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=10000)
